@@ -14,8 +14,8 @@ export default function ResultModal({ result, length, fileName, onClose }) {
       <div className="sheet">
         <video src={result.url} controls playsInline autoPlay />
         <div>
-          <h3 id="doneH">Your Short is ready</h3>
-          <p>Play it back, save the file, then upload it in YouTube Studio. Vertical videos under 3 minutes become Shorts automatically.</p>
+          <h3 id="doneH">Your video is ready</h3>
+          <p>Play it back, then save it and upload it to YouTube Shorts, Instagram Reels or TikTok. All three take 9:16 video like this one.</p>
           <dl className="meta">
             <dt>Size</dt><dd>1080 × 1920 (9:16)</dd>
             <dt>Length</dt><dd>{length} · 30 fps</dd>

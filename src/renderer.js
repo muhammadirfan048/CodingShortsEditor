@@ -32,7 +32,11 @@ export function sceneAt(p, time) {
   return { i: 0, lt: 0, start: 0 };
 }
 
-const lookOf = (p) => LOOKS.find((l) => l.id === p.look) || LOOKS[0];
+function lookOf(p) {
+  const L = LOOKS.find((l) => l.id === p.look) || LOOKS[0];
+  if (p.brandColor && p.useBrand) return { ...L, hi: L.marker ? '#151515' : p.brandColor, markerColor: p.brandColor, brand: p.brandColor };
+  return L;
+}
 const fontOf = (p) => FONTS.find((f) => f.id === p.font) || FONTS[1];
 
 function roundRect(ctx, x, y, w, h, r) {
@@ -160,6 +164,8 @@ function drawBg(ctx, p, time, bgImg) {
 
 /* ---------- text layout ---------- */
 const layoutCache = new Map();
+let mctx = null;
+const measureCtx = () => (mctx || (mctx = document.createElement('canvas').getContext('2d')));
 export const clearLayoutCache = () => layoutCache.clear();
 
 function layoutText(ctx, p, text, sizeMul = 1, maxW = 880) {
@@ -194,7 +200,7 @@ function layoutText(ctx, p, text, sizeMul = 1, maxW = 880) {
 function drawToken(ctx, tk, y, L, text, size, onImage) {
   if (tk.hi && L.marker) {
     ctx.save();
-    ctx.fillStyle = 'rgba(255,214,0,.9)';
+    ctx.fillStyle = L.markerColor || 'rgba(255,214,0,.9)';
     const fw = ctx.measureText(text).width;
     ctx.beginPath();
     ctx.moveTo(tk.x - 12, y - size * 0.72);
@@ -205,6 +211,8 @@ function drawToken(ctx, tk, y, L, text, size, onImage) {
     ctx.fill();
     ctx.restore();
     ctx.fillStyle = '#151515';
+  } else if (L.boxed) {
+    ctx.fillStyle = tk.hi ? (L.brand || '#e11d48') : '#111111';
   } else {
     ctx.fillStyle = tk.hi ? L.hi : onImage ? '#ffffff' : L.fg;
   }
@@ -215,10 +223,12 @@ function drawToken(ctx, tk, y, L, text, size, onImage) {
  * Draws animated text. cy = vertical centre of the block.
  * opts.anim overrides motion, opts.sizeMul scales text, opts.dur is the scene length.
  */
-function drawTextBlock(ctx, p, text, lt, dur, cy, { sizeMul = 1, exit = true, onImage = false, anim } = {}) {
+function drawTextBlock(ctx, p, text, lt, dur, cy, { sizeMul = 1, exit = true, onImage = false, anim, cx = W / 2, maxW = 880 } = {}) {
   if (!text || !text.trim()) return 0;
-  const L = lookOf(p);
-  const lay = layoutText(ctx, p, text, sizeMul);
+  let L = lookOf(p);
+  const boxed = p.textStyle === 'box';
+  if (boxed) L = { ...L, boxed: true, marker: false };
+  const lay = layoutText(ctx, p, text, sizeMul, maxW);
   ctx.font = lay.fontStr;
   ctx.textBaseline = 'alphabetic';
   const blockH = lay.lines.length * lay.lh;
@@ -226,7 +236,22 @@ function drawTextBlock(ctx, p, text, lt, dur, cy, { sizeMul = 1, exit = true, on
   let exitA = 1, exitY = 0;
   if (exit && lt > dur - 0.28) { const q = clamp((dur - lt) / 0.28); exitA = q; exitY = (1 - q) * -40; }
   ctx.save();
-  if (L.shadow || onImage) { ctx.shadowColor = 'rgba(0,0,0,.38)'; ctx.shadowBlur = 28; ctx.shadowOffsetY = 6; }
+  ctx.translate(cx - W / 2, 0);
+  if (boxed) {
+    // a rounded label behind each line, like social captions
+    const q = easeOut(clamp(lt / 0.3));
+    ctx.save();
+    ctx.globalAlpha = q * exitA;
+    ctx.fillStyle = '#ffffff';
+    lay.lines.forEach((ln, li) => {
+      const y = y0 + li * lay.lh + exitY;
+      const lx = (W - ln.w) / 2;
+      const padX = lay.size * 0.28, padT = lay.size * 0.86, padB = lay.size * 0.3;
+      roundRect(ctx, lx - padX, y - padT, ln.w + padX * 2, padT + padB, lay.size * 0.18);
+      ctx.fill();
+    });
+    ctx.restore();
+  } else if (L.shadow || onImage) { ctx.shadowColor = 'rgba(0,0,0,.38)'; ctx.shadowBlur = 28; ctx.shadowOffsetY = 6; }
   const A = anim || p.anim;
   if (A === 'pop') {
     const q = clamp(lt / 0.42);
@@ -269,6 +294,154 @@ function drawTextBlock(ctx, p, text, lt, dur, cy, { sizeMul = 1, exit = true, on
   return blockH;
 }
 
+/* ======================================================================
+   LAYOUT
+   Every scene is made of up to two movable parts:
+     text / caption  -> { cx, cy, w, s }   (centre, wrap width, size)
+     media           -> { x, y, w, h }     (image, video, code or terminal box)
+   sc.layout holds what the user dragged; anything missing uses a default.
+   ====================================================================== */
+const posY = (p) => (p.pos === 'top' ? 640 : p.pos === 'low' ? 1240 : H / 2 - 40);
+export const MEDIA_TYPES = ['image', 'video', 'code', 'terminal'];
+
+function textBox(p, text, user, def) {
+  const t = { ...def, ...(user || {}) };
+  const lay = layoutText(measureCtx(), p, (text || ' ').trim() || ' ', t.s, t.w);
+  const h = Math.max(lay.lh, lay.lines.length * lay.lh);
+  return { kind: 'text', cx: t.cx, cy: t.cy, w: t.w, s: t.s, x: t.cx - t.w / 2, y: t.cy - h / 2, h, user: !!user };
+}
+
+/* ---------- code metrics ---------- */
+const CODE_BAR = 78;
+function codeMetrics(sc, user, top) {
+  const rawLines = (sc.code || '').replace(/\t/g, '  ').split('\n');
+  const maxLen = Math.max(12, ...rawLines.map((l) => l.length));
+  const digits = String(rawLines.length).length;
+  let fs, lh, maxVisible, box;
+  if (user) {
+    fs = clamp(Math.floor((user.w - 122) / (0.61 * (maxLen + digits))), 14, 48);
+    lh = Math.round(fs * 1.6);
+    maxVisible = Math.max(1, Math.floor((user.h - CODE_BAR - 68) / lh));
+    box = { x: user.x, y: user.y, w: user.w, h: user.h };
+  } else {
+    fs = clamp(Math.floor(860 / (maxLen * 0.61)), 22, 36);
+    lh = Math.round(fs * 1.6);
+    maxVisible = Math.floor(1060 / lh);
+    const h = CODE_BAR + 68 + Math.min(rawLines.length, maxVisible) * lh;
+    const y = Math.max(top, Math.min(1500 - h, H / 2 - h / 2 + (top === 560 ? 90 : 0)));
+    box = { x: 40, y, w: W - 80, h };
+  }
+  return { box, fs, lh, maxVisible, rawLines };
+}
+
+/* ---------- terminal metrics ---------- */
+const TERM_BAR = 70;
+const PROMPT = '➜ ~/shorts ';
+function terminalMetrics(sc, user, top) {
+  const { lines } = terminalTiming(sc);
+  const hasOut = (sc.output || '').length > 0;
+  const allRows = [PROMPT + '$ ' + (sc.command || ''), ...(hasOut ? lines : []), PROMPT + '$ '];
+  const maxLen = Math.max(14, ...allRows.map((l) => l.length));
+  let fs, lh, maxVisible, box;
+  if (user) {
+    fs = clamp(Math.floor((user.w - 72) / (0.61 * maxLen)), 14, 48);
+    lh = Math.round(fs * 1.55);
+    maxVisible = Math.max(1, Math.floor((user.h - TERM_BAR - 60) / lh));
+    box = { x: user.x, y: user.y, w: user.w, h: user.h };
+  } else {
+    fs = clamp(Math.floor(880 / (maxLen * 0.61)), 22, 38);
+    lh = Math.round(fs * 1.55);
+    maxVisible = Math.floor(1000 / lh);
+    const h = TERM_BAR + 60 + Math.min(allRows.length, maxVisible) * lh;
+    const y = Math.max(top, Math.min(1500 - h, H / 2 - h / 2 + (top === 560 ? 90 : 0)));
+    box = { x: 40, y, w: W - 80, h };
+  }
+  return { box, fs, lh, maxVisible, lines, hasOut };
+}
+
+/* ---------- image / video metrics ---------- */
+/** The size of the picture shown: the cropped area if there is one. */
+export function naturalSize(sc, assets = {}) {
+  const [w, h] = fullSize(sc, assets);
+  const c = sc.crop;
+  return c ? [w * c.w, h * c.h] : [w, h];
+}
+
+/** The size of the whole uploaded or recorded picture. */
+export function fullSize(sc, assets = {}) {
+  if (sc.type === 'video') {
+    const v = assets.videos && assets.videos.get(sc.id);
+    if (v && v.videoWidth) return [v.videoWidth, v.videoHeight];
+  } else {
+    const img = assets.images && assets.images.get(sc.id);
+    if (img && img.width) return [img.width, img.height];
+  }
+  if (sc.nat) return sc.nat;
+  return sc.frame === 'phone' ? [1170, 2532] : [1600, 1000];
+}
+const browserBar = (w) => Math.round(clamp(w * 0.075, 40, 84));
+const phonePad = (w) => Math.round(w * 0.04);
+
+/** The part of a media box the picture fills (inside any device frame). */
+export function contentRect(box, frame) {
+  if (frame === 'browser') { const b = browserBar(box.w); return { x: box.x, y: box.y + b, w: box.w, h: box.h - b }; }
+  if (frame === 'phone') { const pd = phonePad(box.w); return { x: box.x + pd, y: box.y + pd, w: box.w - pd * 2, h: box.h - pd * 2 }; }
+  return { ...box };
+}
+
+/** The box size that shows the whole picture at width w. */
+export function fittedHeight(frame, w, sw, sh) {
+  if (frame === 'browser') return browserBar(w) + (w * sh) / sw;
+  if (frame === 'phone') { const pd = phonePad(w); return pd * 2 + ((w - pd * 2) * sh) / sw; }
+  return (w * sh) / sw;
+}
+
+function defaultMediaBox(sc, top, sw, sh) {
+  const frame = sc.frame || 'none';
+  const RW = frame === 'phone' ? 640 : W - 80;
+  const RH = 1500 - top;
+  let w = RW;
+  let h = fittedHeight(frame, w, sw, sh);
+  if (h > RH) { w = w * (RH / h); h = fittedHeight(frame, w, sw, sh); }
+  return { x: (W - w) / 2, y: top + (RH - h) / 2, w, h };
+}
+
+/** Where everything in a scene sits at rest. Used by the renderer and the drag editor. */
+export function sceneLayout(p, sc, assets = {}) {
+  const live = assets.live && assets.live.id === sc.id ? assets.live : null;
+  const get = (key) => (live && live.key === key ? live.box : sc.layout && sc.layout[key]) || null;
+  const out = {};
+  if (sc.type === 'text' || !MEDIA_TYPES.includes(sc.type)) {
+    out.text = textBox(p, sc.text, get('text'), { cx: W / 2, cy: posY(p), w: 880, s: 1 });
+    return out;
+  }
+  const hasCap = !!(sc.text && sc.text.trim());
+  if (hasCap) out.caption = textBox(p, sc.text, get('caption'), { cx: W / 2, cy: 400, w: 880, s: 0.7 });
+  const top = hasCap ? 560 : 300;
+  const user = get('media');
+  if (sc.type === 'code') {
+    const m = codeMetrics(sc, user, top);
+    out.media = { kind: 'code', ...m.box, m, user: !!user };
+  } else if (sc.type === 'terminal') {
+    const m = terminalMetrics(sc, user, top);
+    out.media = { kind: 'terminal', ...m.box, m, user: !!user };
+  } else {
+    const [sw, sh] = naturalSize(sc, assets);
+    const b = user ? { x: user.x, y: user.y, w: user.w, h: user.h } : defaultMediaBox(sc, top, sw, sh);
+    out.media = { kind: sc.type, ...b, sw, sh, frame: sc.frame || 'none', user: !!user };
+  }
+  return out;
+}
+
+/* ---------- entrance / exit shared by media ---------- */
+function enterExit(sc, lt) {
+  const enter = easeOut(clamp(lt / 0.45));
+  let alpha = clamp(lt / 0.25);
+  let dy = (1 - enter) * 90;
+  if (!sc._last && lt > sc.dur - 0.28) { const q = clamp((sc.dur - lt) / 0.28); alpha *= q; dy -= (1 - q) * 40; }
+  return { alpha, dy };
+}
+
 /* ---------- code scene ---------- */
 const hlCache = new Map();
 function getHighlighted(code, lang) {
@@ -280,41 +453,20 @@ function getHighlighted(code, lang) {
   return hlCache.get(key);
 }
 
-function drawCodeScene(ctx, p, sc, lt, time, onImage) {
+function drawCodeScene(ctx, p, sc, lt, time, mb) {
+  const { fs, lh, maxVisible, rawLines } = mb.m;
   const lines = getHighlighted(sc.code || '', sc.lang || 'javascript');
-  const rawLines = (sc.code || '').replace(/\t/g, '  ').split('\n');
   const totalChars = rawLines.reduce((a, l) => a + l.length + 1, 0);
   const { typeStart, typeDur } = codeTiming(sc);
   const shown = sc.typing ? Math.floor(clamp((lt - typeStart) / typeDur) * totalChars) : totalChars;
-
-  // caption
-  const capH = sc.text && sc.text.trim() ? 1 : 0;
-  if (capH) drawTextBlock(ctx, p, sc.text, lt, sc.dur, 400, { sizeMul: 0.7, onImage, exit: !sc._last });
-
-  // sizing
-  const maxLen = Math.max(12, ...rawLines.map((l) => l.length));
-  const fs = clamp(Math.floor(860 / (maxLen * 0.61)), 22, 36);
-  const lh = Math.round(fs * 1.6);
-  const maxVisible = Math.floor(1060 / lh);
-  const nVis = Math.min(lines.length, maxVisible);
-  const x = 40, w = W - 80;
-  const barH = 78;
-  const winH = barH + 34 + nVis * lh + 34;
-  const top = capH ? 560 : 300;
-  let y = Math.max(top, Math.min(1500 - winH, H / 2 - winH / 2 + (capH ? 90 : 0)));
-
-  // entrance / exit
-  const enter = easeOut(clamp(lt / 0.45));
-  let alpha = clamp(lt / 0.25);
-  let dy = (1 - enter) * 90;
-  const last = sc._last;
-  if (!last && lt > sc.dur - 0.28) { const q = clamp((sc.dur - lt) / 0.28); alpha *= q; dy -= (1 - q) * 40; }
+  const { x, w } = mb;
+  const winH = mb.h;
+  const barH = CODE_BAR;
+  const { alpha, dy } = enterExit(sc, lt);
 
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.translate(0, dy + y);
-
-  // window
+  ctx.translate(0, dy + mb.y);
   ctx.save();
   ctx.shadowColor = 'rgba(0,0,0,.5)';
   ctx.shadowBlur = 60;
@@ -326,13 +478,11 @@ function drawCodeScene(ctx, p, sc, lt, time, onImage) {
   ctx.save();
   roundRect(ctx, x, 0, w, winH, 26);
   ctx.clip();
-  // title bar
   ctx.fillStyle = ED.bar;
   ctx.fillRect(x, 0, w, barH);
   ['#ff5f57', '#febc2e', '#28c840'].forEach((c, i) => {
     ctx.beginPath(); ctx.arc(x + 40 + i * 34, barH / 2, 11, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill();
   });
-  // tab
   const fname = sc.filename || 'untitled';
   ctx.font = '600 26px "JetBrains Mono", monospace';
   const tabW = ctx.measureText(fname).width + 70;
@@ -345,15 +495,15 @@ function drawCodeScene(ctx, p, sc, lt, time, onImage) {
   ctx.fillStyle = ED.tabText;
   ctx.textBaseline = 'middle';
   ctx.fillText(fname, tabX + 42, 16 + (barH - 16) / 2 + 1);
-  // language label
   const langName = (LANGS.find((l) => l[0] === sc.lang) || ['', ''])[1];
-  ctx.font = '400 22px "JetBrains Mono", monospace';
-  ctx.fillStyle = ED.gutter;
-  ctx.textAlign = 'right';
-  ctx.fillText(langName, x + w - 32, barH / 2 + 1);
-  ctx.textAlign = 'left';
+  if (w > tabX - x + tabW + 200) {
+    ctx.font = '400 22px "JetBrains Mono", monospace';
+    ctx.fillStyle = ED.gutter;
+    ctx.textAlign = 'right';
+    ctx.fillText(langName, x + w - 32, barH / 2 + 1);
+    ctx.textAlign = 'left';
+  }
 
-  // find cursor line/col
   let cursorLine = 0, cursorCol = 0, acc = 0;
   for (let i = 0; i < rawLines.length; i++) {
     const len = rawLines[i].length;
@@ -363,7 +513,6 @@ function drawCodeScene(ctx, p, sc, lt, time, onImage) {
   }
   const scrollTop = Math.max(0, cursorLine - maxVisible + 1);
 
-  // body
   const bodyY = barH + 34;
   ctx.font = `400 ${fs}px "JetBrains Mono", ui-monospace, monospace`;
   ctx.textBaseline = 'middle';
@@ -381,16 +530,14 @@ function drawCodeScene(ctx, p, sc, lt, time, onImage) {
       ctx.fillStyle = ED.activeLine;
       ctx.fillRect(x, ly - lh / 2, w, lh);
     }
-    // line number (only once the line has started typing)
     if (thisStart <= shown) {
       ctx.fillStyle = i === cursorLine ? ED.gutterActive : ED.gutter;
       ctx.textAlign = 'right';
       ctx.fillText(String(i + 1), x + 34 + gutterW, ly);
       ctx.textAlign = 'left';
     }
-    // tokens
     let cx = codeX, ci = thisStart;
-    for (const tk of lines[i]) {
+    for (const tk of lines[i] || []) {
       if (ci >= shown) break;
       const n = Math.min(tk.t.length, shown - ci);
       const part = tk.t.slice(0, n);
@@ -412,7 +559,6 @@ function drawCodeScene(ctx, p, sc, lt, time, onImage) {
     }
   }
   ctx.restore();
-  // hairline border
   roundRect(ctx, x + 0.5, 0.5, w - 1, winH - 1, 26);
   ctx.strokeStyle = ED.border;
   ctx.lineWidth = 2;
@@ -457,31 +603,15 @@ function outputTokens(line) {
   return out;
 }
 
-function drawTerminalScene(ctx, p, sc, lt, time, onImage) {
-  const { cmdStart, cmdDur, outStart, lineStep, lines } = terminalTiming(sc);
+function drawTerminalScene(ctx, p, sc, lt, time, mb) {
+  const { cmdStart, cmdDur, outStart, lineStep } = terminalTiming(sc);
+  const { fs, lh, maxVisible, lines, hasOut } = mb.m;
   const cmd = sc.command || '';
-  const hasOut = (sc.output || '').length > 0;
-  const capH = sc.text && sc.text.trim() ? 1 : 0;
-  if (capH) drawTextBlock(ctx, p, sc.text, lt, sc.dur, 400, { sizeMul: 0.7, onImage, exit: !sc._last });
+  const { x, w } = mb;
+  const winH = mb.h;
+  const barH = TERM_BAR;
+  const { alpha, dy } = enterExit(sc, lt);
 
-  const PROMPT = '➜ ~/shorts ';
-  const allRows = [PROMPT + '$ ' + cmd, ...(hasOut ? lines : []), PROMPT + '$ '];
-  const maxLen = Math.max(14, ...allRows.map((l) => l.length));
-  const fs = clamp(Math.floor(880 / (maxLen * 0.61)), 22, 38);
-  const lh = Math.round(fs * 1.55);
-  const maxVisible = Math.floor(1000 / lh);
-  const nVis = Math.min(allRows.length, maxVisible);
-  const x = 40, w = W - 80, barH = 70;
-  const winH = barH + 30 + nVis * lh + 30;
-  const top = capH ? 560 : 300;
-  const y = Math.max(top, Math.min(1500 - winH, H / 2 - winH / 2 + (capH ? 90 : 0)));
-
-  const enter = easeOut(clamp(lt / 0.45));
-  let alpha = clamp(lt / 0.25);
-  let dy = (1 - enter) * 90;
-  if (!sc._last && lt > sc.dur - 0.28) { const q = clamp((sc.dur - lt) / 0.28); alpha *= q; dy -= (1 - q) * 40; }
-
-  // progress
   const cmdShown = sc.typing ? Math.floor(clamp((lt - cmdStart) / Math.max(0.01, cmdDur)) * cmd.length) : cmd.length;
   const cmdDone = cmdShown >= cmd.length && lt >= cmdStart + cmdDur;
   const outShown = !hasOut ? 0 : lt < outStart ? 0 : Math.min(lines.length, 1 + Math.floor((lt - outStart) / lineStep));
@@ -491,7 +621,7 @@ function drawTerminalScene(ctx, p, sc, lt, time, onImage) {
 
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.translate(0, y + dy);
+  ctx.translate(0, mb.y + dy);
   ctx.save();
   ctx.shadowColor = 'rgba(0,0,0,.55)';
   ctx.shadowBlur = 60;
@@ -510,7 +640,7 @@ function drawTerminalScene(ctx, p, sc, lt, time, onImage) {
   ctx.fillStyle = TERM.dim;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(sc.title || 'Terminal', W / 2, barH / 2 + 1);
+  if (w > 420) ctx.fillText(sc.title || 'Terminal', x + w / 2, barH / 2 + 1);
   ctx.textAlign = 'left';
 
   const font = `400 ${fs}px "JetBrains Mono", ui-monospace, monospace`;
@@ -530,7 +660,6 @@ function drawTerminalScene(ctx, p, sc, lt, time, onImage) {
     if (solid || Math.floor(time * 2.2) % 2 === 0) { ctx.fillStyle = TERM.cursor; ctx.fillRect(cx + 2, rowY(r) - fs * 0.6, fs * 0.55, fs * 1.2); }
   };
 
-  // row 0: command
   if (0 >= scrollTop) {
     const cx = drawPrompt(0);
     const part = cmd.slice(0, cmdShown);
@@ -539,14 +668,12 @@ function drawTerminalScene(ctx, p, sc, lt, time, onImage) {
     ctx.fillText(part, cx, rowY(0));
     if (!cmdDone || (lt >= cmdStart + cmdDur && lt < outStart && hasOut)) cursor(cx + ctx.measureText(part).width, 0, sc.typing && !cmdDone && lt > cmdStart);
   }
-  // output rows
   for (let i = 0; i < outShown; i++) {
     const r = 1 + i;
     if (r < scrollTop) continue;
     let cx = bx;
     for (const tk of outputTokens(lines[i])) { ctx.fillStyle = tk.c; ctx.fillText(tk.t, cx, rowY(r)); cx += ctx.measureText(tk.t).width; }
   }
-  // final prompt
   if (finished) {
     const r = 1 + outShown;
     const cx = drawPrompt(r);
@@ -561,90 +688,172 @@ function drawTerminalScene(ctx, p, sc, lt, time, onImage) {
   ctx.textBaseline = 'alphabetic';
 }
 
-/* ---------- screenshot scene ---------- */
-function drawImageScene(ctx, p, sc, lt, img, onImage) {
-  const capH = sc.text && sc.text.trim() ? 1 : 0;
-  if (capH) drawTextBlock(ctx, p, sc.text, lt, sc.dur, 400, { sizeMul: 0.7, onImage, exit: !sc._last });
-  const boxTop = capH ? 560 : 300;
-  const boxW = W - 80, boxH = 1500 - boxTop;
-  const enter = easeOut(clamp(lt / 0.5));
-  let alpha = clamp(lt / 0.25);
-  let dy = (1 - enter) * 90;
-  if (!sc._last && lt > sc.dur - 0.28) { const q = clamp((sc.dur - lt) / 0.28); alpha *= q; dy -= (1 - q) * 40; }
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  if (!img) {
-    const h = 640, y = boxTop + (boxH - h) / 2 + dy;
-    roundRect(ctx, 40, y, boxW, h, 28);
-    ctx.fillStyle = 'rgba(255,255,255,.08)';
-    ctx.fill();
-    ctx.setLineDash([16, 12]);
-    ctx.strokeStyle = 'rgba(255,255,255,.5)';
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = 'rgba(255,255,255,.85)';
-    ctx.font = '600 40px "Hanken Grotesk", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('Add a screenshot to this scene', W / 2, y + h / 2);
-    ctx.textAlign = 'left';
-    ctx.restore();
+/* ---------- image & video scenes ---------- */
+/** Fill rect r with the picture (or the cropped part `sr` of it), cutting off what doesn't fit. */
+function drawCover(ctx, src, sw, sh, r, zoom = 1, sr = null) {
+  const s = Math.max(r.w / sw, r.h / sh) * zoom;
+  const dw = sw * s, dh = sh * s;
+  if (sr) ctx.drawImage(src, sr.x, sr.y, sr.w, sr.h, r.x + (r.w - dw) / 2, r.y + (r.h - dh) / 2, dw, dh);
+  else ctx.drawImage(src, r.x + (r.w - dw) / 2, r.y + (r.h - dh) / 2, dw, dh);
+}
+
+function cropRect(sc, src) {
+  const c = sc.crop;
+  if (!c || !src) return null;
+  const fw = src.videoWidth || src.naturalWidth || src.width;
+  const fh = src.videoHeight || src.naturalHeight || src.height;
+  if (!fw) return null;
+  return { x: c.x * fw, y: c.y * fh, w: c.w * fw, h: c.h * fh };
+}
+
+/** A neutral "web page" sketch, shown until an image or video is added. */
+function drawPlaceholder(ctx, r, kind) {
+  const u = Math.min(r.w, r.h * 1.4) / 100;
+  if (kind === 'video') {
+    ctx.fillStyle = '#141821';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = 'rgba(255,255,255,.06)';
+    for (let i = 0; i < 4; i++) { roundRect(ctx, r.x + r.w * 0.08, r.y + r.h * (0.14 + i * 0.12), r.w * (0.84 - i * 0.12), r.h * 0.06, 8); ctx.fill(); }
+    const R = Math.max(26, u * 9);
+    ctx.fillStyle = 'rgba(255,255,255,.92)';
+    ctx.beginPath(); ctx.arc(r.x + r.w / 2, r.y + r.h * 0.66, R, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#141821';
+    ctx.beginPath(); ctx.moveTo(r.x + r.w / 2 - R * 0.32, r.y + r.h * 0.66 - R * 0.42); ctx.lineTo(r.x + r.w / 2 + R * 0.48, r.y + r.h * 0.66); ctx.lineTo(r.x + r.w / 2 - R * 0.32, r.y + r.h * 0.66 + R * 0.42); ctx.closePath(); ctx.fill();
     return;
   }
-  const s = Math.min(boxW / img.width, boxH / img.height);
-  const w = img.width * s, h = img.height * s;
-  const x = (W - w) / 2, y = boxTop + (boxH - h) / 2 + dy;
+  ctx.fillStyle = '#f4f5f8';
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  const bar = (x, y, w, h, c, rad = 6) => { ctx.fillStyle = c; roundRect(ctx, r.x + x * r.w, r.y + y * r.h, w * r.w, h * r.h, rad); ctx.fill(); };
+  bar(0, 0, 1, 0.09, '#ffffff', 0);
+  bar(0.06, 0.03, 0.16, 0.03, '#d6dae3');
+  bar(0.62, 0.03, 0.1, 0.03, '#e3e6ec'); bar(0.76, 0.03, 0.18, 0.03, '#c7cdd8');
+  bar(0.06, 0.17, 0.62, 0.06, '#c9ced8'); bar(0.06, 0.26, 0.44, 0.06, '#c9ced8');
+  bar(0.06, 0.36, 0.5, 0.025, '#dde1e8'); bar(0.06, 0.4, 0.42, 0.025, '#dde1e8');
+  bar(0.06, 0.48, 0.22, 0.06, '#9aa3b5', 10);
+  for (let i = 0; i < 3; i++) {
+    bar(0.06 + i * 0.3, 0.62, 0.27, 0.3, '#ffffff', 12);
+    bar(0.09 + i * 0.3, 0.65, 0.21, 0.12, '#e6e9ef', 8);
+    bar(0.09 + i * 0.3, 0.8, 0.17, 0.025, '#dde1e8');
+    bar(0.09 + i * 0.3, 0.84, 0.12, 0.025, '#e6e9ef');
+  }
+}
+
+function drawFrameChrome(ctx, box, frame, sc) {
+  if (frame === 'browser') {
+    const b = browserBar(box.w);
+    ctx.fillStyle = '#1f232b';
+    ctx.fillRect(box.x, box.y, box.w, b);
+    const dot = b * 0.13;
+    ['#ff5f57', '#febc2e', '#28c840'].forEach((c, i) => { ctx.beginPath(); ctx.arc(box.x + b * 0.5 + i * dot * 3, box.y + b / 2, dot, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill(); });
+    const ux = box.x + b * 0.5 + dot * 9, uw = box.w - (ux - box.x) - b * 0.5;
+    if (uw > 80) {
+      ctx.fillStyle = '#2d323c';
+      roundRect(ctx, ux, box.y + b * 0.2, uw, b * 0.6, b * 0.3); ctx.fill();
+      ctx.font = `500 ${Math.round(b * 0.32)}px "Hanken Grotesk", sans-serif`;
+      ctx.fillStyle = '#c9ced6';
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'center';
+      const url = (sc.url || 'yourwebsite.com').replace(/^https?:\/\//, '');
+      ctx.fillText('🔒 ' + url, ux + uw / 2, box.y + b / 2 + 1, uw - 30);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    }
+  }
+}
+
+function drawMediaScene(ctx, p, sc, lt, time, mb, src) {
+  const frame = mb.frame;
+  const fill = mb.x <= 1 && mb.y <= 1 && mb.x + mb.w >= W - 1 && mb.y + mb.h >= H - 1 && frame === 'none';
+  const { alpha, dy } = fill ? { alpha: sc._first ? 1 : clamp(lt / 0.3), dy: 0 } : enterExit(sc, lt);
+  const zoomOn = sc.zoom ?? sc.type === 'image';
+  const z = zoomOn ? 1 + 0.07 * easeOut(clamp(lt / sc.dur)) : 1;
+  const r = contentRect(mb, frame);
+  const ready = src && (sc.type !== 'video' || src.readyState >= 2);
+
   ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,.5)';
-  ctx.shadowBlur = 60;
-  ctx.shadowOffsetY = 24;
-  roundRect(ctx, x, y, w, h, 24);
-  ctx.fillStyle = '#000';
-  ctx.fill();
-  ctx.restore();
-  ctx.save();
-  roundRect(ctx, x, y, w, h, 24);
-  ctx.clip();
-  const z = 1 + 0.08 * easeOut(clamp(lt / sc.dur));
-  ctx.translate(x + w / 2, y + h / 2);
-  ctx.scale(z, z);
-  ctx.drawImage(img, -w / 2, -h / 2, w, h);
-  ctx.restore();
+  ctx.globalAlpha = alpha;
+  ctx.translate(0, dy);
+  if (frame === 'phone') {
+    const R = mb.w * 0.13;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 70; ctx.shadowOffsetY = 28;
+    roundRect(ctx, mb.x, mb.y, mb.w, mb.h, R); ctx.fillStyle = '#0b0b0d'; ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#3a3d44'; ctx.lineWidth = Math.max(3, mb.w * 0.006);
+    roundRect(ctx, mb.x + 2, mb.y + 2, mb.w - 4, mb.h - 4, R - 2); ctx.stroke();
+    ctx.save();
+    roundRect(ctx, r.x, r.y, r.w, r.h, Math.max(8, R - (mb.w * 0.04)));
+    ctx.clip();
+    if (ready) drawCover(ctx, src, mb.sw, mb.sh, r, z, cropRect(sc, src)); else drawPlaceholder(ctx, r, sc.type);
+    ctx.restore();
+    // dynamic island
+    ctx.fillStyle = '#000';
+    const iw = mb.w * 0.28, ih = Math.max(10, mb.w * 0.07);
+    roundRect(ctx, mb.x + (mb.w - iw) / 2, r.y + ih * 0.5, iw, ih, ih / 2); ctx.fill();
+  } else {
+    const rad = fill ? 0 : frame === 'browser' ? 20 : 24;
+    if (!fill) {
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 60; ctx.shadowOffsetY = 24;
+      roundRect(ctx, mb.x, mb.y, mb.w, mb.h, rad); ctx.fillStyle = '#000'; ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    roundRect(ctx, mb.x, mb.y, mb.w, mb.h, rad);
+    ctx.clip();
+    if (ready) drawCover(ctx, src, mb.sw, mb.sh, r, z, cropRect(sc, src));
+    else if (src && sc.type === 'video') { ctx.fillStyle = '#141821'; ctx.fillRect(r.x, r.y, r.w, r.h); }
+    else drawPlaceholder(ctx, r, sc.type);
+    drawFrameChrome(ctx, mb, frame, sc);
+    ctx.restore();
+  }
   ctx.restore();
 }
 
 /* ---------- progress + handle ---------- */
-function drawChrome(ctx, p, time, onImage) {
+function drawChrome(ctx, p, time, onImage, logo) {
   const L = lookOf(p);
-  const dark = !(L.paper && !onImage);
-  const n = p.scenes.length;
-  const gap = 10, x0 = 60, x1 = W - 60;
-  const segW = (x1 - x0 - gap * (n - 1)) / n;
-  const { i, lt } = sceneAt(p, time);
-  for (let k = 0; k < n; k++) {
-    const x = x0 + k * (segW + gap);
-    ctx.fillStyle = dark ? 'rgba(255,255,255,.28)' : 'rgba(0,0,0,.15)';
-    roundRect(ctx, x, 92, segW, 8, 4); ctx.fill();
-    const f = k < i ? 1 : k > i ? 0 : clamp(lt / p.scenes[k].dur);
-    if (f > 0) { ctx.fillStyle = dark ? '#fff' : '#151515'; roundRect(ctx, x, 92, Math.max(8, segW * f), 8, 4); ctx.fill(); }
+  const dark = !((L.paper || L.light) && !onImage);
+  if (p.progress !== false) {
+    const n = p.scenes.length;
+    const gap = 10, x0 = 60, x1 = W - 60;
+    const segW = (x1 - x0 - gap * (n - 1)) / n;
+    const { i, lt } = sceneAt(p, time);
+    for (let k = 0; k < n; k++) {
+      const x = x0 + k * (segW + gap);
+      ctx.fillStyle = dark ? 'rgba(255,255,255,.28)' : 'rgba(0,0,0,.15)';
+      roundRect(ctx, x, 92, segW, 8, 4); ctx.fill();
+      const f = k < i ? 1 : k > i ? 0 : clamp(lt / p.scenes[k].dur);
+      if (f > 0) { ctx.fillStyle = dark ? '#fff' : '#151515'; roundRect(ctx, x, 92, Math.max(8, segW * f), 8, 4); ctx.fill(); }
+    }
   }
   const h = (p.handle || '').trim();
-  if (!h) return;
+  if (!h && !logo) return;
   ctx.font = '600 38px "Hanken Grotesk", sans-serif';
   ctx.textBaseline = 'middle';
-  const tw = ctx.measureText(h).width;
+  const tw = h ? ctx.measureText(h).width : 0;
   ctx.fillStyle = dark ? 'rgba(0,0,0,.28)' : 'rgba(0,0,0,.06)';
-  roundRect(ctx, 60, 128, tw + 104, 66, 33); ctx.fill();
-  ctx.fillStyle = L.hi === '#151515' ? '#ffb020' : L.hi;
-  ctx.beginPath(); ctx.arc(93, 161, 22, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#151515';
-  ctx.font = '700 24px "Hanken Grotesk", sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText((h.replace('@', '')[0] || '?').toUpperCase(), 93, 162);
-  ctx.textAlign = 'left';
-  ctx.font = '600 38px "Hanken Grotesk", sans-serif';
-  ctx.fillStyle = dark ? '#fff' : '#151515';
-  ctx.fillText(h, 128, 162);
+  roundRect(ctx, 60, 128, h ? tw + 104 : 66, 66, 33); ctx.fill();
+  if (logo) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(93, 161, 24, 0, Math.PI * 2); ctx.clip();
+    ctx.fillStyle = '#fff'; ctx.fillRect(69, 137, 48, 48);
+    drawCover(ctx, logo, logo.width, logo.height, { x: 69, y: 137, w: 48, h: 48 });
+    ctx.restore();
+  } else {
+    ctx.fillStyle = L.brand || (L.hi === '#151515' ? '#ffb020' : L.hi);
+    ctx.beginPath(); ctx.arc(93, 161, 22, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#151515';
+    ctx.font = '700 24px "Hanken Grotesk", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText((h.replace('@', '')[0] || '?').toUpperCase(), 93, 162);
+    ctx.textAlign = 'left';
+  }
+  if (h) {
+    ctx.font = '600 38px "Hanken Grotesk", sans-serif';
+    ctx.fillStyle = dark ? '#fff' : '#151515';
+    ctx.fillText(h, 128, 162);
+  }
   ctx.textBaseline = 'alphabetic';
 }
 
@@ -654,14 +863,22 @@ export function renderFrame(ctx, p, time, assets) {
   drawBg(ctx, p, time, bgImg);
   if (!p.scenes.length) return;
   const { i, lt } = sceneAt(p, time);
-  const sc = { ...p.scenes[i], _last: i === p.scenes.length - 1 };
-  const onImage = !!bgImg;
-  if (sc.type === 'code') drawCodeScene(ctx, p, sc, lt, time, onImage);
-  else if (sc.type === 'terminal') drawTerminalScene(ctx, p, sc, lt, time, onImage);
-  else if (sc.type === 'image') drawImageScene(ctx, p, sc, lt, assets.images.get(sc.id), onImage);
-  else {
-    const cy = p.pos === 'top' ? 640 : p.pos === 'low' ? 1240 : H / 2 - 40;
-    drawTextBlock(ctx, p, sc.text, lt, sc.dur, cy, { exit: !sc._last, onImage });
+  const sc = { ...p.scenes[i], _last: i === p.scenes.length - 1, _first: i === 0 };
+  const lay = sceneLayout(p, sc, assets);
+  let onImage = !!bgImg;
+  const mb = lay.media;
+  if (mb) {
+    if (sc.type === 'code') drawCodeScene(ctx, p, sc, lt, time, mb);
+    else if (sc.type === 'terminal') drawTerminalScene(ctx, p, sc, lt, time, mb);
+    else {
+      const src = sc.type === 'video' ? assets.videos && assets.videos.get(sc.id) : assets.images.get(sc.id);
+      drawMediaScene(ctx, p, sc, lt, time, mb, src);
+      if (mb.w >= W * 0.9 && mb.h >= H * 0.6) onImage = true; // text sits on top of a big picture
+    }
   }
-  drawChrome(ctx, p, time, onImage);
+  const tb = lay.text || lay.caption;
+  if (tb) {
+    drawTextBlock(ctx, p, sc.text, lt, sc.dur, tb.cy, { cx: tb.cx, maxW: tb.w, sizeMul: tb.s, exit: !sc._last, onImage });
+  }
+  drawChrome(ctx, p, time, onImage, assets.logo);
 }

@@ -175,6 +175,7 @@ export class AudioEngine {
     this.cache = new Map(); // built-in track id -> AudioBuffer
     this.custom = new Map(); // 'music' | 'typing' | 'whoosh' | 'scene:<id>' -> AudioBuffer
     this.nodes = [];
+    this.videos = new Map(); // sceneId -> { el, node, gain }
   }
 
   /** Must be called from a click (browsers only allow audio after a gesture). */
@@ -188,9 +189,46 @@ export class AudioEngine {
       this.master.connect(this.ctx.destination);
       this.master.connect(this.recordDest);
       this.noise = noiseBuffer(this.ctx, 2);
+      this.videos.forEach((_, id) => this.attachVideo(id));
     }
     if (this.ctx.state === 'suspended') this.ctx.resume();
     return this.ctx;
+  }
+
+  /* ---------- video sound ----------
+     A video element's sound is routed through the mixer so it is heard in the
+     preview, recorded into the export, and can lower the music. */
+  registerVideo(id, el) {
+    this.unregisterVideo(id);
+    this.videos.set(id, { el });
+    if (this.ctx) this.attachVideo(id);
+  }
+
+  attachVideo(id) {
+    const v = this.videos.get(id);
+    if (!v || v.node || !this.ctx) return;
+    try {
+      v.node = this.ctx.createMediaElementSource(v.el);
+      v.gain = this.ctx.createGain();
+      v.gain.gain.value = 0;
+      v.node.connect(v.gain).connect(this.master);
+    } catch { /* already attached elsewhere */ }
+  }
+
+  unregisterVideo(id) {
+    const v = this.videos.get(id);
+    if (!v) return;
+    try { v.node && v.node.disconnect(); v.gain && v.gain.disconnect(); } catch { /* ignore */ }
+    this.videos.delete(id);
+  }
+
+  setVideoGains(p) {
+    p.scenes.forEach((sc) => {
+      const v = this.videos.get(sc.id);
+      if (!v || !v.gain) return;
+      const on = sc.type === 'video' && sc.videoAudio !== false;
+      v.gain.gain.value = on ? (sc.videoVol ?? 100) / 100 : 0;
+    });
   }
 
   get stream() { return this.recordDest ? this.recordDest.stream : null; }
@@ -241,6 +279,7 @@ export class AudioEngine {
     if (!ctx) return;
     this.stop();
     const token = this.token;
+    this.setVideoGains(p);
     const total = totalDuration(p);
     const startAt = ctx.currentTime + 0.03;
     const toCtx = (t) => startAt + (t - t0);
@@ -297,6 +336,8 @@ export class AudioEngine {
       let start = acc;
       const end = acc + sc.dur;
       acc = end;
+      // a video's own sound lowers the music too
+      if (sc.type === 'video' && sc.videoAudio !== false && sc.hasAudio !== false && this.videos.has(sc.id)) spans.push([start, end]);
       // your uploaded audio wins; otherwise the automatic voiceover, if it's on
       let buf = this.custom.get('scene:' + sc.id);
       let lead = 0;
@@ -321,6 +362,7 @@ export class AudioEngine {
       this.nodes.push(src, g);
     });
     // merge spans that nearly touch so the music doesn't pump between scenes
+    spans.sort((a, b) => a[0] - b[0]);
     const merged = [];
     spans.forEach(([s0, e0]) => {
       const last = merged[merged.length - 1];
