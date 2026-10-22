@@ -74,6 +74,9 @@ The voices come from the free, open-source **Kokoro** model, which runs on your 
 ## Project layout
 
 ```
+public/
+  logo.svg                 the Shortsmith logo (header and browser tab icon)
+  icon-512.png             app icon for phones (Add to Home Screen)
 src/
   App.jsx                  main app: state, playback, video sync, screen recording, export, undo
   renderer.js              draws every frame (backgrounds, text, images, videos, frames, code, terminal) and the layout of every scene
@@ -100,4 +103,5 @@ src/
 - **New background:** add an entry to `LOOKS` in `src/presets.js`.
 - **New music track:** add an entry to `SONGS` in `src/audio.js` and to `MUSIC_TRACKS`.
 - **More voices:** add ids to `VOICES` in `src/tts.js`.
+- **Logo colour:** change `#ffb020` in `public/logo.svg` (the header logo follows the `--accent` colour in `src/styles.css`).
 - **Higher quality export:** change `videoBitsPerSecond` in `src/App.jsx`.

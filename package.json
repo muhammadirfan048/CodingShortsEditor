@@ -1,7 +1,7 @@
 {
   "name": "shortsmith",
   "private": true,
-  "version": "7.1.0",
+  "version": "7.2.0",
   "type": "module",
   "description": "A vertical video editor for YouTube Shorts, Instagram Reels and TikTok: text, images, videos, screen recordings, code and terminal scenes, with music, voiceovers and drag-and-resize editing, all in your browser.",
   "scripts": {
